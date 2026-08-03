@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Excel dosyaları (kullanıcı verisi — repoya gönderilmez)
+docs/*.xlsx
+docs/*.xls
+docs/*.xlsm
+docs/*.xlsb
+docs/~$*
+docs/backups/
+
+# Veritabanı
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
