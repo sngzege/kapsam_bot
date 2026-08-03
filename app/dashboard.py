@@ -1,18 +1,21 @@
 """Kapsam Bot — Analitik Dashboard (Streamlit + Plotly)
 
-Bu dosya, Aşama 1 hattı tarafından doldurulan SQLite veritabanını
-(`data/kapsam_bot.db`, tablo: `geri_bildirim`) okuyarak etkileşimli bir
-analiz arayüzü sunar.
+Aşama 1 hattı tarafından doldurulan SQLite veritabanını
+(`data/kapsam_bot.db`, tablo: `geri_bildirim`) okuyarak etkileşimli
+analiz sunar. Ayrıca Output tablosundaki TUM/DIS satırlarından HPU ve
+HPU Kapsam değerlerini de hesaplar.
 
-Önemli güvenlik ve performans notları:
-- Kullanıcıdan gelen DEĞERLER (filtre seçimleri) parametreli SQL ile geçirilir.
-- Kullanıcının X/Y ekseni olarak seçtiği KOLON ADLARI, sabit bir whitelist
-  üzerinden doğrulanmadan SQL içine yazılmaz.
+Güvenlik / Performans:
+- Kullanıcıdan gelen **değerler** (`?` placeholder) parametreli SQL ile geçirilir.
+- Kullanıcının seçtiği **kolon adları** sabit bir whitelist üzerinden doğrulanır;
+  asla doğrudan SQL'ye yazılmaz (SQL enjeksiyonuna karşı koruma).
 - Filtreler SQL seviyesinde (WHERE) uygulanır; tüm tablo pandas'e yüklenip
-  sonra filtrelenmez.
-- Sorgu fonksiyonları `@st.cache_data(ttl=60)` ile önbelleğe alınır ve önbellek
-  anahtarına veritabanı dosyasının mtime değeri eklenir; böylece yeni bir
-  pipeline çalıştırması önbelleği otomatik geçersiz kılar.
+  filtrelenmez.
+- Sorgular `@st.cache_data` ile önbelleğe alınır; anahtarın mtime'ı
+  değiştiğinde (yeni pipeline çalıştırması) önbellek geçersizleşir.
+
+Çalıştırma:  python app/main.py   (önce veri aktar)
+            streamlit run app/dashboard.py
 """
 
 from __future__ import annotations
@@ -23,31 +26,26 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Sabit tanımlar
-# ---------------------------------------------------------------------------
-# Dosya konumu: app/dashboard.py -> proje kökü -> data/kapsam_bot.db
+# --------------------------------------------------------------------------- #
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "kapsam_bot.db"
 TABLE = "geri_bildirim"
 
-# Kullanıcının X ekseni olarak seçebileceği kategorik / tarihsel sütunlar.
-# (etiket -> veritabanı kolon adı)
+# Kullanıcının X / Y ekseni olarak seçebileceği (etiket -> kolon) haritalar.
 X_COLUMNS = {
-    "İşyeri Kodu (Çalışma Yapan Disiplin)": "calisma_yapan_disiplin",
+    "İşyeri Kodu": "calisma_yapan_disiplin",
     "Program Haftası": "program_haftasi",
     "TUM / GBY": "tum_gby",
     "Sipariş": "siparis",
     "Teknik Birim": "teknik_birim",
     "Rapor Tipi": "rapor_tipi",
     "Sorumlu Şef": "sorumlu_sef",
-    "Sorumlu İşyeri / TPY Disiplin": "sorumlu_isyeri_tpy_disiplin",
     "Planlanan Başlangıç Tarihi": "planlanan_baslangic_tarihi",
-    "Gerçekleşen Başlangıç Tarihi": "gerceklesen_baslangic_tarihi",
 }
-
-# Kullanıcının Y ekseni olarak seçebileceği sayısal sütunlar.
 Y_COLUMNS = {
     "Planlanan Süre (dk)": "planlanan_sure_dk",
     "Normal Mesai (dk)": "normal_mesai_dk",
@@ -59,7 +57,7 @@ Y_COLUMNS = {
     "Metraj 2 Miktar": "metraj2_miktar",
 }
 
-# Sidebar filtrelerinde kullanılan sütunlar (sabit kolon adları).
+# Sidebar filtrelerinde kullanılan sütunlar.
 FILTER_COLUMNS = [
     "program_haftasi",
     "calisma_yapan_disiplin",
@@ -73,33 +71,38 @@ ALLOWED_COLUMNS = (
     set(X_COLUMNS.values())
     | set(Y_COLUMNS.values())
     | set(FILTER_COLUMNS)
+    | {"id_1"}
 )
 
 AGG_FUNCS = {"Toplam": "SUM", "Ortalama": "AVG", "Adet": "COUNT"}
 
 
 def _valid_col(col: str) -> str:
-    """Bir kolon adının whitelist içinde olduğunu doğrular.
+    """Kolon adının whitelist içinde olduğunu doğrular.
 
     Kullanıcı girdisi olarak gelen kolon adları bu kontrolden geçmeden
-    SQL ifadesine yazılamaz (SQL enjeksiyonuna karşı koruma).
+    SQL ifadesine yazılmaz.
     """
     if col not in ALLOWED_COLUMNS:
         raise ValueError(f"İzin verilmeyen kolon adı: {col!r}")
     return col
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Sorgu yardımcıları (önbelleğe alınmış)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+def _conn(db_path: str):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 @st.cache_data(ttl=60)
 def table_exists(db_path: str, mtime: float) -> bool:
-    """Hedef tablonun veritabanında var olup olmadığını döndürür."""
-    conn = sqlite3.connect(db_path)
+    conn = _conn(db_path)
     try:
         cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (TABLE,),
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)
         )
         return cur.fetchone() is not None
     finally:
@@ -108,9 +111,8 @@ def table_exists(db_path: str, mtime: float) -> bool:
 
 @st.cache_data(ttl=60)
 def get_distinct(db_path: str, mtime: float, column: str):
-    """Belirli bir kolonun DISTINCT değerlerini döndürür (filtre seçenekleri)."""
     _valid_col(column)
-    conn = sqlite3.connect(db_path)
+    conn = _conn(db_path)
     try:
         cur = conn.execute(
             f'SELECT DISTINCT "{column}" FROM {TABLE} '
@@ -123,12 +125,11 @@ def get_distinct(db_path: str, mtime: float, column: str):
 
 
 def _build_where(f) -> tuple[str, list]:
-    """Filtre tuple'ından parametreli bir WHERE cümlesi ve değer listesi üretir.
+    """Filtre tuple'ından parametreli WHERE cümlesi + değer listesi üretir.
 
-    `f` tuple sırası:
-        (program_haftasi, tum_dis, disiplin, teknik, rapor, sef,
-         tarih_etkin, t_start, t_end)
-    Kolon adları sabittir; tüm kullanıcı DEĞERLERİ `?` placeholder ile geçirilir.
+    `f` = (program_haftasi, tum_dis, disiplin, teknik, rapor, sef,
+           tarih_etkin, t_start, t_end)
+    Kolon adları sabittir; kullanıcı DEĞERLERİ `?` placeholder ile geçirilir.
     """
     (prog, tum_dis, disiplin, teknik, rapor, sef,
      tarih_etkin, t_start, t_end) = f
@@ -137,34 +138,24 @@ def _build_where(f) -> tuple[str, list]:
     params: list = []
 
     if prog:
-        placeholders = ", ".join("?" * len(prog))
-        clauses.append(f"program_haftasi IN ({placeholders})")
+        ph = ", ".join("?" * len(prog))
+        clauses.append(f"program_haftasi IN ({ph})")
         params.extend(prog)
-
     if tum_dis == "tum":
         clauses.append("calisma_yapan_disiplin LIKE 'TUM-%'")
     elif tum_dis == "dis":
         clauses.append("calisma_yapan_disiplin LIKE '%-DIS'")
 
-    if disiplin:
-        placeholders = ", ".join("?" * len(disiplin))
-        clauses.append(f"calisma_yapan_disiplin IN ({placeholders})")
-        params.extend(disiplin)
+    def _in(col, vals):
+        if vals:
+            ph = ", ".join("?" * len(vals))
+            clauses.append(f'"{col}" IN ({ph})')
+            params.extend(vals)
 
-    if teknik:
-        placeholders = ", ".join("?" * len(teknik))
-        clauses.append(f"teknik_birim IN ({placeholders})")
-        params.extend(teknik)
-
-    if rapor:
-        placeholders = ", ".join("?" * len(rapor))
-        clauses.append(f"rapor_tipi IN ({placeholders})")
-        params.extend(rapor)
-
-    if sef:
-        placeholders = ", ".join("?" * len(sef))
-        clauses.append(f"sorumlu_sef IN ({placeholders})")
-        params.extend(sef)
+    _in("calisma_yapan_disiplin", disiplin)
+    _in("teknik_birim", teknik)
+    _in("rapor_tipi", rapor)
+    _in("sorumlu_sef", sef)
 
     if tarih_etkin and t_start and t_end:
         clauses.append("date(planlanan_baslangic_tarihi) >= ?")
@@ -172,55 +163,123 @@ def _build_where(f) -> tuple[str, list]:
         clauses.append("date(planlanan_baslangic_tarihi) <= ?")
         params.append(t_end)
 
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    return where, params
+    return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
 @st.cache_data(ttl=60)
 def get_filtered_rows(db_path: str, mtime: float, f) -> pd.DataFrame:
-    """Filtrelere uyan tüm satırları (SQL seviyesinde filtrelenmiş) döndürür."""
     where, params = _build_where(f)
-    sql = f"SELECT * FROM {TABLE} {where}"
-    conn = sqlite3.connect(db_path)
+    conn = _conn(db_path)
     try:
-        return pd.read_sql_query(sql, conn, params=params)
+        return pd.read_sql_query(f"SELECT * FROM {TABLE} {where}", conn, params=params)
     finally:
         conn.close()
 
 
 @st.cache_data(ttl=60)
 def get_chart_data(db_path: str, mtime: float, f, x_col: str,
-                   y_col: str, agg: str) -> pd.DataFrame:
-    """Grafik için X'e göre gruplanmış toplulaştırılmış veriyi döndürür."""
+                   y_cols: tuple, agg: str) -> pd.DataFrame:
+    """X'e göre gruplandırılmış, birden fazla Y için toplulaştırılmış veri."""
     _valid_col(x_col)
-    _valid_col(y_col)
+    for y in y_cols:
+        _valid_col(y)
     agg_sql = AGG_FUNCS[agg]
     where, params = _build_where(f)
-    sql = (
-        f'SELECT "{x_col}" AS x, {agg_sql}("{y_col}") AS y '
-        f"FROM {TABLE} {where} "
-        f'GROUP BY "{x_col}" ORDER BY "{x_col}"'
+    selects = ", ".join(
+        f'{agg_sql}("{y}") AS "{y}"' for y in y_cols
     )
-    conn = sqlite3.connect(db_path)
+    # x için DISTINCT değerleri de alalım (grup satırlarındaki label)
+    conn = _conn(db_path)
     try:
-        return pd.read_sql_query(sql, conn, params=params)
+        # X label'ları
+        xcur = conn.execute(
+            f'SELECT DISTINCT "{x_col}" FROM {TABLE} {where} '
+            f'GROUP BY "{x_col}" ORDER BY "{x_col}"',
+            params,
+        )
+        x_labels = [r[0] for r in xcur.fetchall()]
+        # Her Y için ayrı topluluk
+        df = pd.DataFrame({"_x": x_labels})
+        for y in y_cols:
+            ycur = conn.execute(
+                f'SELECT "{x_col}", {agg_sql}("{y}") AS v '
+                f'FROM {TABLE} {where} GROUP BY "{x_col}" ORDER BY "{x_col}"',
+                params,
+            )
+            vals = {r[0]: r[1] for r in ycur.fetchall()}
+            df[y] = df["_x"].map(vals).fillna(0)
+        df.drop(columns=["_x"], inplace=True)
+        return df
     finally:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
+@st.cache_data(ttl=60)
+def get_hpu_from_db(db_path: str, mtime: float) -> dict:
+    """Output tablosuna denk HPU / HPU Kapsam değerlerini DB'den hesaplar.
+
+    HPU = K / (P - A - L + F)   (K: kazanılan süre, P: planlanan, A: acil,
+                                 L: ilave, F: fazla mesai)
+    """
+    conn = _conn(db_path)
+    try:
+        sums = conn.execute(
+            f"SELECT "
+            f"  SUM(CASE WHEN rapor_tipi LIKE '%Programlı İş%' THEN 1 ELSE 0 END) AS p_cnt,"
+            f"  SUM(planlanan_sure_dk) AS p,"
+            f"  SUM(CASE WHEN rapor_tipi LIKE '%Acil İş%' OR rapor_tipi LIKE '%Duruş İşi%' THEN 1 ELSE 0 END) AS a_cnt,"
+            f"  SUM(CASE WHEN rapor_tipi LIKE '%Acil İş%' OR rapor_tipi LIKE '%Duruş İşi%' THEN top_harcanan_sure_dk ELSE 0 END) AS a,"
+            f"  SUM(CASE WHEN rapor_tipi LIKE '%İlave iş-2%' THEN top_harcanan_sure_dk ELSE 0 END) AS l,"
+            f"  SUM(fazla_mesai_dk) AS f,"
+            f"  SUM(CASE WHEN rapor_tipi LIKE '%Programlı İş%' AND ("
+            f"  geribildirim_sahadan_gelen_bilgi LIKE 'HD%' OR "
+            f"  geribildirim_sahadan_gelen_bilgi LIKE 'Alt%' OR "
+            f"  geribildirim_sahadan_gelen_bilgi LIKE 'Tamam%' ) "
+            f"  THEN kazanilan_sure_dk ELSE 0 END) AS k, "
+            f"  SUM(CASE WHEN rapor_tipi LIKE '%Programlı İş%' AND ("
+            f"  geribildirim_sahadan_gelen_bilgi LIKE 'HD%' OR "
+            f"  geribildirim_sahadan_gelen_bilgi LIKE 'Alt%' OR "
+            f"  geribildirim_sahadan_gelen_bilgi LIKE 'Tamam%' ) AND "
+            f" (top_harcanan_sure_dk - kazanilan_sure_dk) > 100 "
+            f"  THEN (top_harcanan_sure_dk - kazanilan_sure_dk) ELSE 0 END) AS k1 "
+            f"FROM {TABLE}"
+        ).fetchone()
+        p, a, l, f, k, k1 = sums["p"], sums["a"], sums["l"], sums["f"], sums["k"], sums["k1"] or 0
+        payda = p - a - l + f
+        hpu = (k / payda) if payda else 0.0
+        hpu_kapsam = ((k + k1) / payda) if payda else 0.0
+        return {"hpu": hpu, "hpu_kapsam": hpu_kapsam}
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # Ana uygulama
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 def main() -> None:
     st.set_page_config(page_title="Kapsam Bot — Analiz", layout="wide")
+
+    # --- Pencere boyutu ayarı ------------------------------------------------
+    st.sidebar.header("⚙️ Pencere")
+    layout = st.sidebar.radio(
+        "Sayfa düzeni",
+        options=["wide", "centered"],
+        format_func=lambda v: "Geniş" if v == "wide" else "Ortalanmış",
+        horizontal=True,
+    )
+    if layout != "wide":
+        st.markdown(
+            "<style> .main .block-container { max-width: 900px; }</style>",
+            unsafe_allow_html=True,
+        )
 
     st.title("Kapsam Bot — Analitik Dashboard")
     st.caption(
         "Excel geri bildirim verisinden hesaplanan KPI'ları filtreleyerek "
-        "etkileşimli olarak inceleyin."
+        "etkileşimli grafiklerle inceleyin."
     )
 
-    # --- Veritabanı varlık kontrolü -------------------------------------
+    # --- Veritabanı kontrolü ------------------------------------------------
     if not DB_PATH.exists():
         st.error(
             "Veritabanı dosyası bulunamadı: `data/kapsam_bot.db`.\n\n"
@@ -230,7 +289,6 @@ def main() -> None:
         st.stop()
 
     mtime = DB_PATH.stat().st_mtime
-
     if not table_exists(str(DB_PATH), mtime):
         st.error(
             "`geri_bildirim` tablosu veritabanında bulunamadı. "
@@ -240,9 +298,8 @@ def main() -> None:
 
     db_str = str(DB_PATH)
 
-    # --- Sidebar: dinamik filtreler -------------------------------------
+    # --- Sidebar: dinamik filtreler ------------------------------------------
     st.sidebar.header("Filtreler")
-
     prog_opts = get_distinct(db_str, mtime, "program_haftasi")
     disiplin_opts = get_distinct(db_str, mtime, "calisma_yapan_disiplin")
     teknik_opts = get_distinct(db_str, mtime, "teknik_birim")
@@ -250,42 +307,29 @@ def main() -> None:
     sef_opts = get_distinct(db_str, mtime, "sorumlu_sef")
 
     sel_prog = st.sidebar.multiselect("Program Haftası", prog_opts)
-
     tum_dis = st.sidebar.radio(
         "Kategori (TUM / DİS)",
         options=["hepsi", "tum", "dis"],
-        format_func=lambda v: {
-            "hepsi": "Hepsi",
-            "tum": "TUM (TUM-*)",
-            "dis": "DİS (*-DIS)",
-        }[v],
+        format_func=lambda v: {"hepsi": "Hepsi", "tum": "TUM (TUM-*)",
+                               "dis": "DİS (*-DIS)"}[v],
         horizontal=True,
     )
-
-    sel_disiplin = st.sidebar.multiselect(
-        "Çalışma Yapan Disiplin", disiplin_opts
-    )
+    sel_disiplin = st.sidebar.multiselect("Çalışma Yapan Disiplin", disiplin_opts)
     sel_teknik = st.sidebar.multiselect("Teknik Birim", teknik_opts)
     sel_rapor = st.sidebar.multiselect("Rapor Tipi", rapor_opts)
     sel_sef = st.sidebar.multiselect("Sorumlu Şef", sef_opts)
 
-    tarih_etkin = st.sidebar.checkbox(
-        "Tarih aralığına göre filtrele (Planlanan Başlangıç)"
-    )
-    t_start = None
-    t_end = None
+    tarih_etkin = st.sidebar.checkbox("Tarih aralığına göre filtrele (Planlanan Başlangıç)")
+    t_start = t_end = None
     if tarih_etkin:
         tarih_araligi = st.sidebar.date_input(
             "Planlanan Başlangıç Tarihi Aralığı",
             value=(date.today(), date.today()),
         )
-        # Kullanıcı tek tarih veya tarih aralığı seçebilir; yalnızca
-        # iki tarih seçiliyse filtre uygulanır.
         if isinstance(tarih_araligi, (tuple, list)) and len(tarih_araligi) == 2:
             t_start = tarih_araligi[0].isoformat()
             t_end = tarih_araligi[1].isoformat()
 
-    # Filtreleri hash'lenebilir bir tuple içinde topla (önbellek anahtarı).
     f = (
         tuple(sel_prog),
         tum_dis,
@@ -298,71 +342,107 @@ def main() -> None:
         t_end,
     )
 
-    # --- Filtrelenmiş veriyi SQL seviyesinde çek ------------------------
+    # --- KPI kartları -------------------------------------------------------
+    st.subheader("Özet Göstergeler (KPI)")
     try:
         df = get_filtered_rows(db_str, mtime, f)
-    except Exception as exc:  # pragma: no cover - savunma amaçlı
+    except Exception as exc:  # savunma
         st.error(f"Veri sorgulanırken bir hata oluştu: {exc}")
         st.stop()
-
-    # --- KPI kartları ---------------------------------------------------
-    st.subheader("Özet Göstergeler (KPI)")
-    c1, c2, c3, c4, c5 = st.columns(5)
 
     def _safe_sum(col: str) -> float:
         if col not in df.columns or len(df) == 0:
             return 0.0
         return float(pd.to_numeric(df[col], errors="coerce").sum())
 
-    c1.metric("Kayıt Sayısı", len(df))
-    c2.metric("Planlanan Süre (dk)", round(_safe_sum("planlanan_sure_dk"), 1))
-    c3.metric("Top. Harcanan Süre (dk)", round(_safe_sum("top_harcanan_sure_dk"), 1))
-    c4.metric("Kazanılan Süre (dk)", round(_safe_sum("kazanilan_sure_dk"), 1))
-    c5.metric("Fazla Mesai (dk)", round(_safe_sum("fazla_mesai_dk"), 1))
+    cols = st.columns(5)
+    cols[0].metric("Kayıt Sayısı", len(df))
+    cols[1].metric("Planlanan Süre (dk)", round(_safe_sum("planlanan_sure_dk"), 1))
+    cols[2].metric("Kazanılan Süre (dk)", round(_safe_sum("kazanilan_sure_dk"), 1))
+    cols[3].metric("Top. Harcanan Süre (dk)", round(_safe_sum("top_harcanan_sure_dk"), 1))
+    cols[4].metric("Fazla Mesai (dk)", round(_safe_sum("fazla_mesai_dk"), 1))
 
-    # --- Grafik kontrolleri ---------------------------------------------
+    # HPU hızlı kart (DB'den global olarak hesaplanır, filtrelere göre değil)
+    hpu = get_hpu_from_db(db_str, mtime)
+    hcol1, hcol2 = st.columns(2)
+    hcol1.metric("HPU (Küresel)", f"{hpu['hpu']:.4f}")
+    hcol2.metric("HPU Kapsam (Küresel)", f"{hpu['hpu_kapsam']:.4f}")
+
+    # --- Grafik kontrolleri -------------------------------------------------
     st.subheader("Grafik")
     x_keys = list(X_COLUMNS.keys())
     y_keys = list(Y_COLUMNS.keys())
-    default_x = "İşyeri Kodu (Çalışma Yapan Disiplin)"
+    default_x = "İşyeri Kodu"
     default_y = "Planlanan Süre (dk)"
 
-    col_x, col_y, col_agg, col_type = st.columns(4)
+    col_x, col_y_multi, col_agg, col_type = st.columns([1, 2, 1, 1])
     x_label = col_x.selectbox("X Ekseni", x_keys, index=x_keys.index(default_x))
-    y_label = col_y.selectbox("Y Ekseni", y_keys, index=y_keys.index(default_y))
+    # ÇOKLU Y SEÇİMİ
+    y_labels = col_y_multi.multiselect(
+        "Y Ekseni (birden fazla seçilebilir)",
+        y_keys,
+        default=[default_y],
+    )
+    if not y_labels:
+        st.warning("En az bir Y ekseni seçin.")
+        st.stop()
     agg = col_agg.selectbox("Toplulaştırma", list(AGG_FUNCS.keys()))
     chart_type = col_type.selectbox("Grafik Tipi", ["Bar", "Line", "Scatter"])
 
     x_col = _valid_col(X_COLUMNS[x_label])
-    y_col = _valid_col(Y_COLUMNS[y_label])
+    y_cols = tuple(_valid_col(Y_COLUMNS[y]) for y in y_labels)
 
     if df.empty:
         st.info("Seçilen filtrelere uygun kayıt bulunamadı.")
     else:
         try:
-            chart_df = get_chart_data(db_str, mtime, f, x_col, y_col, agg)
-        except Exception as exc:  # pragma: no cover
+            chart_df = get_chart_data(db_str, mtime, f, x_col, y_cols, agg)
+        except Exception as exc:
             st.error(f"Grafik verisi oluşturulurken hata: {exc}")
             chart_df = pd.DataFrame()
 
-        if chart_df.empty:
+        if chart_df.empty or chart_df.shape[0] == 0:
             st.info("Seçilen eksen ve filtrelerle grafik çizilemedi (veri yok).")
         else:
-            title = f"{agg} — {y_label} göre {x_label}"
+            title = f"{agg} — {', '.join(y_labels)} göre {x_label}"
             if chart_type == "Bar":
-                fig = px.bar(chart_df, x="x", y="y", title=title,
-                             labels={"x": x_label, "y": y_label})
+                # Çoklu Y için gruplanmış bar
+                if len(y_cols) > 1:
+                    fig = go.Figure()
+                    for y in y_cols:
+                        fig.add_trace(go.Bar(
+                            name=y, x=chart_df.index, y=chart_df[y],
+                            text=chart_df[y].round(1), textposition="auto",
+                        ))
+                    fig.update_layout(barmode="group", legend_title_text="Metrik")
+                else:
+                    fig = px.bar(chart_df, x=chart_df.index, y=y_cols[0],
+                                 labels={"x": x_label}, title=title)
             elif chart_type == "Line":
-                fig = px.line(chart_df, x="x", y="y", title=title,
-                              labels={"x": x_label, "y": y_label},
-                              markers=True)
+                # ÇOKLU DEĞİŞKEN ÇİZGİ GRAFİĞİ
+                fig = go.Figure()
+                for y in y_cols:
+                    fig.add_trace(go.Scatter(
+                        name=y, x=chart_df.index, y=chart_df[y],
+                        mode="lines+markers",
+                    ))
+                fig.update_layout(legend_title_text="Metrik")
             else:  # Scatter
-                fig = px.scatter(chart_df, x="x", y="y", title=title,
-                                 labels={"x": x_label, "y": y_label})
-            fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
+                fig = go.Figure()
+                for y in y_cols:
+                    fig.add_trace(go.Scatter(
+                        name=y, mode="markers",
+                        x=chart_df.index, y=chart_df[y],
+                    ))
+                fig.update_layout(legend_title_text="Metrik")
+
+            fig.update_layout(
+                margin=dict(l=20, r=20, t=40, b=20),
+                xaxis_title=x_label,
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-    # --- Ham veri (ilk 1000 satır) + CSV indirme ------------------------
+    # --- Ham veri + CSV -----------------------------------------------------
     with st.expander("Filtrelenmiş Ham Veri (ilk 1000 satır)"):
         if df.empty:
             st.write("Gösterilecek veri yok.")
