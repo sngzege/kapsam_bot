@@ -63,7 +63,7 @@ python app/main.py
 
 Program şu adımları sırayla yapar:
 
-1. Kaynak Excel okunur (`Geri BildirimPuantaj.xlsx`, Geri Bildirim sayfası, 5. satırdan itibaren, AH sütununa kadar).
+1. Kaynak Excel okunur (`Geri-BildirimPuantaj.xlsx`, Geri Bildirim sayfası, 5. satırdan itibaren, AH sütununa kadar).
 2. `HPU.xlsx` dosyasının `Geri Bildirim` sayfasına yalnızca değerler (values-only) yazılır. Yazmadan önce `HPU.xlsx` otomatik olarak `docs/backups/` klasörüne yedeklenir.
 3. Veriler SQLite veritabanına INSERT/UPDATE edilir (`ID-1` benzersiz anahtarıdır; programı tekrar çalıştırınca çift kayıt oluşmaz, mevcut kayıt güncellenir).
 4. K/A/L/P grupları ve E sütunundaki işyeri kodu alt kümeleri hesaplanır.
